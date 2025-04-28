@@ -6,12 +6,11 @@ from gymnasium import spaces
 from mpe2 import simple_tag_v3
 from pettingzoo import AECEnv
 from rich import print
-from rich.console import Console
 from stable_baselines3.common.noise import NormalActionNoise
 
-from td3bc_diffsion import TD3_BC
+from td3bc import TD3_BC
 
-console = Console()
+# from td3bc_diffsion import TD3_BC_Diffusion
 
 
 class MultiDiscreteToContinuousWrapper(gym.Wrapper):
@@ -55,7 +54,9 @@ class PettingZooToGymWrapper(gym.Env):
             dtype=np.uint8,
         )
 
-    def reset(self):
+    def reset(self, seed=None):
+        if seed is not None and hasattr(self.pettingzoo_env, "seed"):
+            self.pettingzoo_env.seed(seed)
         self.pettingzoo_env.reset()
         return self._get_observations()
 
@@ -78,8 +79,8 @@ class PettingZooToGymWrapper(gym.Env):
             for agent in self.pettingzoo_env.agents
         }
 
-    def render(self, mode="human"):
-        self.pettingzoo_env.render()
+    def render(self, mode=None):
+        self.pettingzoo_env.render(mode=mode)
 
     def close(self):
         self.pettingzoo_env.close()
@@ -92,8 +93,8 @@ if __name__ == "__main__":
     total_files = len([file for file in os.listdir(env_dir)])
     result_dir = os.path.join(env_dir, f"{total_files + 1}")
     os.makedirs(result_dir)
-    env = simple_tag_v3.env(render_mode="human")
-    eval_env = simple_tag_v3.env(render_mode="human")
+    env = simple_tag_v3.env(render_mode=None)
+    eval_env = simple_tag_v3.env(render_mode=None)
     env = PettingZooToGymWrapper(env)
     eval_env = PettingZooToGymWrapper(eval_env)
     n_actions = 5

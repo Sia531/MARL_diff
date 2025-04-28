@@ -4,9 +4,50 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from rich.console import Console
 from stable_baselines3 import TD3
 
 from Network import CommunicationNetwork, Network
+
+console = Console()
+
+
+class ReplayBuffer:
+    def __init__(self, max_size=1000000):
+        self.max_size = max_size
+        self.observations = []
+        self.actions = []
+        self.rewards = []
+        self.next_observations = []
+        self.dones = []
+        self.infos = []
+
+    def add(self, obs, action, reward, next_obs, done, info):
+        self.observations.append(obs)
+        self.actions.append(action)
+        self.rewards.append(reward)
+        self.next_observations.append(next_obs)
+        self.dones.append(done)
+        self.infos.append(info)
+
+        if len(self.observations) > self.max_size:
+            self.observations.pop(0)
+            self.actions.pop(0)
+            self.rewards.pop(0)
+            self.next_observations.pop(0)
+            self.dones.pop(0)
+            self.infos.pop(0)
+
+    def sample(self, batch_size):
+        indices = np.random.choice(len(self.observations), batch_size)
+        return {
+            "observations": [self.observations[i] for i in indices],
+            "actions": [self.actions[i] for i in indices],
+            "rewards": [self.rewards[i] for i in indices],
+            "next_observations": [self.next_observations[i] for i in indices],
+            "dones": [self.dones[i] for i in indices],
+            "infos": [self.infos[i] for i in indices],
+        }
 
 
 class TD3_BC(TD3):
@@ -17,7 +58,7 @@ class TD3_BC(TD3):
         self.critic_loss = nn.MSELoss()
         self.env = env
 
-        self.size = 10000000
+        self.max_size = 10000000
         self.observations = []
         self.actions = []
         self.rewards = []
@@ -35,6 +76,19 @@ class TD3_BC(TD3):
             "sum_reward": [],
         }
         self.eval_frequency = eval_frequency
+
+        self.action_shape = 5
+        self.state_shape = 6
+        self.max_action = 1
+        self.beta_schedule = "vp"
+        self.n_timesteps = 10
+        self.bc_coef = False
+        self.actor_lr = 0.0005
+        self.wd = 1e-4
+        self.algorithm_times = []
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.policy.to(self.device)
 
         self.chasers_comm_network = CommunicationNetwork(
             input_dim=16, output_dim=14
@@ -54,18 +108,6 @@ class TD3_BC(TD3):
         total_steps = 0
         gradient_steps = 1000
 
-        self.action_shape = 5
-        self.state_shape = 6
-        self.max_action = 1
-        self.beta_schedule = "vp"
-        self.n_timesteps = 10
-        self.bc_coef = False
-        self.actor_lr = 0.0005
-        self.wd = 1e-4
-        self.algorithm_times = []
-
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.policy.to(self.device)
         self._fill_replay_buffer(num_steps=100000)
 
         while total_steps < total_timesteps:
@@ -78,11 +120,6 @@ class TD3_BC(TD3):
             f"[yellow]Total training time: {sum(self.algorithm_times):.2f}s[/yellow]"
         )
 
-        self.plot_actor_loss()
-        self.plot_sum_reward_loss()
-        self.plot_average_reward_loss()
-        self.plot_runtime()
-
     def train(self, gradient_steps, eval_env, batch_size=100):
         console.log("[cyan]🔥 Start training...[/cyan]")
 
@@ -91,7 +128,7 @@ class TD3_BC(TD3):
             next_observations = []
             runners_obs, chasers_obs = [], []
 
-            replay_data = self.ReplayBuffer.sample(self, batch_size)
+            replay_data = self.ReplayBuffer.sample(batch_size)
             actions = torch.tensor(replay_data["actions"], dtype=torch.float32).to(
                 self.device
             )
@@ -112,12 +149,15 @@ class TD3_BC(TD3):
             )
 
             for obs in replay_data["observations"]:
-                tensor_obs = torch.tensor(obs, dtype=torch.float32)
+                if isinstance(obs, torch.Tensor):
+                    tensor_obs = obs.clone().detach()
+                else:
+                    tensor_obs = torch.tensor(obs, dtype=torch.float32)
                 (runners_obs if len(obs) == 14 else chasers_obs).append(tensor_obs)
 
             chaser_obs_tensor = (
                 torch.stack(chasers_obs) if chasers_obs else torch.tensor([])
-            )
+            ).to(self.device)
             communicated_observations = self.chasers_comm_network(chaser_obs_tensor)
 
             if communicated_observations.size(0) % batch_size != 0:
@@ -142,7 +182,7 @@ class TD3_BC(TD3):
                 noise = noise.unsqueeze(1).expand(-1, self.action_space.shape[0])
                 next_observations = torch.stack(
                     [obs.float() for obs in next_observations]
-                )
+                ).to(self.device)
                 next_observations = self.network(next_observations)
 
                 next_actions = (self.actor_target(next_observations) + noise).clamp(
@@ -245,68 +285,41 @@ class TD3_BC(TD3):
 
     def _fill_replay_buffer(self, num_steps=0):
         console.log("[bold cyan]⏳ Filling replay buffer...[/bold cyan]")
-        obs = env.reset()
+        obs = self.env.reset()
         steps = 0
-
+        self.ReplayBuffer = ReplayBuffer(max_size=self.max_size)
         while steps <= num_steps:
-            for agent in env.pettingzoo_env.agent_iter():
+            for agent in self.env.pettingzoo_env.agent_iter():
                 done = False
-                action = env.pettingzoo_env.action_space(agent).sample()
-                env.pettingzoo_env.step(action)
-                next_obs = env.pettingzoo_env.observe(agent)
-                reward, termination, truncation, info = env.pettingzoo_env.last()[1:]
+                action = self.env.pettingzoo_env.action_space(agent).sample()
+                self.env.pettingzoo_env.step(action)
+                next_obs = self.env.pettingzoo_env.observe(agent)
+                reward, termination, truncation, info = self.env.pettingzoo_env.last()[
+                    1:
+                ]
                 done = termination or truncation
 
-                if agent != "agent_0":
-                    obs = (
-                        F.pad(torch.tensor(obs, dtype=torch.float32), (0, 2))
-                        if len(obs) == 14
-                        else obs
-                    )
-                    next_obs = (
-                        F.pad(torch.tensor(next_obs, dtype=torch.float32), (0, 2))
-                        if len(next_obs) == 14
-                        else next_obs
-                    )
-                    self.ReplayBuffer.add(
-                        self, obs, action, reward, next_obs, done, info
-                    )
+                # if agent != "agent_0":
+                obs = (
+                    F.pad(torch.tensor(obs, dtype=torch.float32), (0, 2))
+                    if len(obs) == 14
+                    else obs
+                )
+                next_obs = (
+                    F.pad(torch.tensor(next_obs, dtype=torch.float32), (0, 2))
+                    if len(next_obs) == 14
+                    else next_obs
+                )
+                if len(obs) == 16 and len(next_obs) == 16:
+                    self.ReplayBuffer.add(obs, action, reward, next_obs, done, info)
 
                 obs = next_obs
                 steps += 1
                 if done:
-                    env.reset()
-                    obs = env.pettingzoo_env.observe(agent)
+                    self.env.reset()
+                    obs = self.env.pettingzoo_env.observe(agent)
 
                 if steps > num_steps:
                     break
 
         console.log("[bold green]✅ Replay buffer filled![/bold green]")
-
-    class ReplayBuffer:
-        def add(self, obs, action, reward, next_obs, done, info):
-            self.observations.append(obs)
-            self.actions.append(action)
-            self.rewards.append(reward)
-            self.next_observations.append(next_obs)
-            self.dones.append(done)
-            self.infos.append(info)
-
-            if len(self.observations) > self.size:
-                self.observations.pop(0)
-                self.actions.pop(0)
-                self.rewards.pop(0)
-                self.next_observations.pop(0)
-                self.dones.pop(0)
-                self.infos.pop(0)
-
-        def sample(self, batch_size):
-            indices = np.random.choice(len(self.observations), batch_size)
-            return {
-                "observations": [self.observations[i] for i in indices],
-                "actions": [self.actions[i] for i in indices],
-                "rewards": [self.rewards[i] for i in indices],
-                "next_observations": [self.next_observations[i] for i in indices],
-                "dones": [self.dones[i] for i in indices],
-                "infos": [self.infos[i] for i in indices],
-            }
